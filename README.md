@@ -543,6 +543,85 @@ The following questions cover filesystem concepts beyond the implementation scop
 
 ---
 
+## Answers
+
+### Q5.1: How pes checkout <branch> should work
+
+- Resolve the target branch ref from `.pes/refs/heads/<branch>` and read the target commit hash.
+- Read target commit object, then its root tree.
+- Update `.pes/HEAD` to `ref: refs/heads/<branch>` (or keep detached mode logic separately).
+- Rewrite working directory to match target tree snapshot:
+   - Create missing files/directories.
+   - Overwrite tracked files that differ.
+   - Remove tracked files/directories that are not present in target tree.
+- Rewrite `.pes/index` so it matches the checked-out tree state.
+
+Complexity comes from safe working-tree updates, conflict detection with local modifications, directory recursion, file deletions, and atomicity guarantees if checkout fails midway.
+
+### Q5.2: Dirty working directory conflict detection using index + object store
+
+For each tracked path in index:
+
+- Compare current filesystem metadata (`mtime`/`size`) with index entry.
+- If metadata differs, hash working file content and compare with index blob hash.
+- If hash differs, file is dirty.
+
+Then compare the current commit tree path hash vs target branch tree path hash:
+
+- If file is dirty in working directory.
+- And file content differs between current tree and target tree.
+- Refuse checkout for that path because switching would overwrite uncommitted work.
+
+This is equivalent to checking three versions: working tree, current snapshot, target snapshot.
+
+### Q5.3: Detached HEAD behavior and recovery
+
+In detached HEAD, new commits are created normally, but no branch name moves with them. Only HEAD points to the latest commit hash. Once user switches away, those commits can become unreachable from branch refs.
+
+Recovery options:
+
+- Immediately create a branch pointing to current detached commit (`refs/heads/<new-branch>`).
+- If already moved away, recover via reflog-like history (if implemented) or from remembered commit hash.
+- After creating a branch ref, commits are reachable again and protected from GC.
+
+### Q6.1: Unreachable object GC algorithm
+
+Mark-and-sweep approach:
+
+- Initialize a hash-set `reachable`.
+- Seed traversal from all refs in `.pes/refs/heads/*` and optionally tags.
+- DFS/BFS commits:
+   - Mark commit object.
+   - Visit parent commit(s).
+   - Visit commit's tree.
+- DFS/BFS trees:
+   - Mark tree object.
+   - For each entry, mark referenced blob/tree and recurse for subtrees.
+- Enumerate all files in `.pes/objects/**`.
+- Delete any object not in `reachable`.
+
+Efficient structure: hash set keyed by 32-byte binary hash (or hex string).
+
+For 100,000 commits and 50 branches, visited commit count is typically near unique commit count (about 100,000, not 5,000,000) because branch histories overlap heavily. Total objects visited is commits plus reachable trees/blobs, usually several times commit count depending on project churn.
+
+### Q6.2: Why concurrent GC is dangerous
+
+Race example:
+
+- Commit process writes new blob/tree objects.
+- Before branch ref is updated to the new commit, those objects are temporarily unreachable from refs.
+- Concurrent GC scans refs, does not see the new commit path, and deletes those newly written objects.
+- Commit process then updates ref to point at a commit referencing missing objects, corrupting repository history.
+
+How Git avoids this:
+
+- Uses object reachability grace periods and reflogs.
+- Uses packfile and lock protocols to coordinate writers/GC.
+- Avoids pruning very recent unreachable objects (`gc.pruneExpire` default window).
+- Uses atomic ref updates and filesystem locks to reduce races.
+
+---
+
 ## Submission Checklist
 
 ### Screenshots Required
